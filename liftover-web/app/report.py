@@ -20,6 +20,9 @@ unmapped 行没有候选，相关列写 '.'。
 
 双段（两份 chain 依次迁移）结果使用 ``build_tsv2`` /
 ``build_adjudicated_tsv2``，列定义见文末 ``TSV2_HEADER``。
+双段结果的质量筛选版使用 ``build_filtered_tsv2``：在双段 25 列末尾
+追加 ``final_coverage`` 列，且只包含通过筛选的行与路径（unmapped 行
+绝不写入）。
 """
 
 from __future__ import annotations
@@ -297,4 +300,43 @@ def build_adjudicated_tsv2(
                 for fi, frag in enumerate(path.fragments, start=1):
                     values = _path_fragment_values(row, path, frag, fi)
                     writer.writerow(values + [decision])
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# 双段结果的质量筛选版导出
+#
+# 在双段 25 列末尾追加一列 ``final_coverage``（该路径 seg2_covered/total_len，
+# 即筛选时使用的最终覆盖率），只包含通过筛选的行与路径：
+#
+# - unmapped 行按规则绝不写入；
+# - 歧义行只写出通过阈值的路径（path_index 保持原序号），status 列保持原值。
+# ---------------------------------------------------------------------------
+
+FILTERED_TSV2_HEADER = TSV2_HEADER + ["final_coverage"]
+
+
+def format_ratio(value: float) -> str:
+    """覆盖率比值的紧凑文本（如 ``1``、``0.833333``、``0.0625``），最多 6 位小数。"""
+    text = f"{value:.6f}".rstrip("0").rstrip(".")
+    return text if text else "0"
+
+
+def build_filtered_tsv2(rows: list[RowResult2]) -> str:
+    """质量筛选版双段 TSV。
+
+    ``rows`` 应已通过 ``filtering.filter_double_rows`` 筛选（不含 unmapped
+    行、路径均已达到阈值）；此处对无候选行同样跳过，保证 unmapped 行绝不
+    写入筛选结果。
+    """
+    buf = io.StringIO(newline="")
+    writer = csv.writer(buf, delimiter="\t", lineterminator="\n",
+                        quoting=csv.QUOTE_MINIMAL)
+    writer.writerow(FILTERED_TSV2_HEADER)
+    for row in rows:
+        for path in row.candidates:
+            ratio = format_ratio(path.final_coverage)
+            for fi, frag in enumerate(path.fragments, start=1):
+                values = _path_fragment_values(row, path, frag, fi)
+                writer.writerow(values + [ratio])
     return buf.getvalue()

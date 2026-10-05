@@ -1,4 +1,4 @@
-"""FastAPI 入口：上传、预览、下载、歧义人工裁决。
+"""FastAPI 入口：上传、预览、下载、歧义人工裁决、双段结果质量筛选。
 
 结果只在校验完全通过后保存在进程内存中（BytesIO 等价物），
 任何解析错误都直接 400 返回，不创建、更不提供任何可下载文件。
@@ -13,11 +13,18 @@
 - 裁决状态（选了哪个候选）带版本号做乐观并发控制，相同版本的并发
   修改只有一次能成功；
 - 裁决版 TSV 由 ``GET /api/download/{token}/adjudicated`` 单独导出。
+
+双段结果的质量筛选（``POST /api/result/{token}/filter``）同样只是
+原结果的导出视图：按每条路径的最终覆盖率（seg2_covered/total）与保留
+状态筛选，产物挂在独立的 filter token 下
+（``GET /api/download/filtered/{filter_token}``），原任务的字节内容、
+裁决状态与版本号在筛选前后完全不变。
 """
 
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import secrets
 import time
@@ -32,9 +39,11 @@ from .chain import parse_chain
 from .engine import RowResult
 from .engine import LiftOverEngine
 from .engine2 import TwoSegmentEngine
+from .filtering import FILTER_STATUSES, filter_double_rows
 from .report import (
     build_adjudicated_tsv,
     build_adjudicated_tsv2,
+    build_filtered_tsv2,
     build_tsv,
     build_tsv2,
     rows_to_preview,
@@ -47,7 +56,7 @@ MAX_UPLOAD_BYTES = int(os.getenv("LIFTOVER_MAX_UPLOAD_MB", "50")) * 1024 * 1024
 JOB_TTL_SECONDS = int(os.getenv("LIFTOVER_JOB_TTL_SECONDS", "3600"))
 MAX_JOBS = int(os.getenv("LIFTOVER_MAX_JOBS", "100"))
 
-app = FastAPI(title="离线基因组区间迁移 (BED liftover)", version="1.2.0")
+app = FastAPI(title="离线基因组区间迁移 (BED liftover)", version="1.3.0")
 
 
 @dataclass
@@ -63,7 +72,18 @@ class _Job:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
+@dataclass
+class _FilterJob:
+    """一次质量筛选的产物（独立于原任务，不改动原任务任何状态）。"""
+
+    tsv_bytes: bytes             # 筛选版 TSV（生成后不变）
+    filename: str
+    created_at: float
+    parent_token: str            # 来源任务 token（仅溯源用）
+
+
 _jobs: dict[str, _Job] = {}
+_filter_jobs: dict[str, _FilterJob] = {}
 
 
 def _prune_jobs() -> None:
@@ -75,6 +95,14 @@ def _prune_jobs() -> None:
     if len(_jobs) > MAX_JOBS:
         for k in sorted(_jobs, key=lambda x: _jobs[x].created_at)[: len(_jobs) - MAX_JOBS]:
             _jobs.pop(k, None)
+    expired_f = [k for k, j in _filter_jobs.items()
+                 if now - j.created_at > JOB_TTL_SECONDS]
+    for k in expired_f:
+        _filter_jobs.pop(k, None)
+    if len(_filter_jobs) > MAX_JOBS:
+        for k in sorted(_filter_jobs,
+                        key=lambda x: _filter_jobs[x].created_at)[: len(_filter_jobs) - MAX_JOBS]:
+            _filter_jobs.pop(k, None)
 
 
 def _read_upload(f: UploadFile) -> str:
@@ -396,6 +424,146 @@ async def download_adjudicated(token: str) -> Response:
         content=payload,
         media_type="text/tab-separated-values; charset=utf-8",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# 双段结果质量筛选
+# ---------------------------------------------------------------------------
+
+def _require_min_coverage(body: dict) -> float:
+    if "min_coverage" not in body:
+        raise HTTPException(status_code=400,
+                            detail={"errors": ["缺少字段 min_coverage"]})
+    val = body["min_coverage"]
+    # bool 是 int 的子类，显式拒绝，避免 true 被当成 1
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise HTTPException(
+            status_code=400,
+            detail={"errors": [f"min_coverage 必须是 0~1 之间的数值，收到 {val!r}"]},
+        )
+    if not math.isfinite(val):
+        raise HTTPException(
+            status_code=400,
+            detail={"errors": [f"min_coverage 必须是有限数值，收到 {val!r}"]},
+        )
+    if not 0.0 <= val <= 1.0:
+        raise HTTPException(
+            status_code=400,
+            detail={"errors": [
+                f"min_coverage 超出允许范围 [0, 1]：收到 {val!r}，"
+                "请传入 0~1 之间（含边界）的最小最终覆盖率"
+            ]},
+        )
+    return float(val)
+
+
+def _require_keep_statuses(body: dict) -> list[str]:
+    allowed = "、".join(FILTER_STATUSES)
+    if "keep_statuses" not in body:
+        raise HTTPException(status_code=400,
+                            detail={"errors": ["缺少字段 keep_statuses"]})
+    val = body["keep_statuses"]
+    if not isinstance(val, list) or not val:
+        raise HTTPException(
+            status_code=400,
+            detail={"errors": [
+                f"keep_statuses 必须是非空数组，元素取自：{allowed}"
+            ]},
+        )
+    bad = [s for s in val if not isinstance(s, str) or s not in FILTER_STATUSES]
+    if bad:
+        raise HTTPException(
+            status_code=400,
+            detail={"errors": [
+                f"keep_statuses 含非法状态 {bad!r}；允许值：{allowed}"
+            ]},
+        )
+    # 去重并保持用户给出的顺序
+    return list(dict.fromkeys(val))
+
+
+def _filtered_name(filename: str, min_coverage: float) -> str:
+    cov = f"{min_coverage:g}"
+    if filename.endswith(".tsv"):
+        return f"{filename[:-4]}.filtered.min-cov-{cov}.tsv"
+    return f"{filename}.filtered.min-cov-{cov}.tsv"
+
+
+@app.post("/api/result/{token}/filter")
+async def filter_result(token: str, request: Request) -> dict:
+    """双段结果质量筛选：最小最终覆盖率 + 保留状态。
+
+    请求体：``{"min_coverage": <0~1 数值>, "keep_statuses": ["mapped",
+    "partial", "ambiguous", "unmapped"]}``。
+
+    - 只适用于双段转换结果（``POST /api/liftover2`` 产生的 token）；
+      单段结果 → 400，token 不存在/过期 → 404；
+    - 覆盖率按每条路径的 seg2_covered/total 计算，达到阈值（含边界）
+      的路径通过；歧义行保留通过阈值的全部路径，不自动裁决；
+    - unmapped 行始终计入返回的统计（counts），但不写入筛选结果；
+    - 参数非法（阈值越界、类型错误、状态集合为空或含非法值）→ 400，
+      且原任务不发生任何改变；
+    - 成功时返回筛选后的预览、各状态数量与 filter token，
+      筛选版 TSV 由 ``GET /api/download/filtered/{filter_token}`` 下载。
+    """
+    body = await _read_json_body(request)
+    min_coverage = _require_min_coverage(body)
+    keep_statuses = _require_keep_statuses(body)
+
+    job = _get_job_or_404(token)
+    if job.kind != "double":
+        raise HTTPException(
+            status_code=400,
+            detail={"errors": [
+                "质量筛选仅适用于双段转换结果（POST /api/liftover2）；"
+                "当前结果是单段转换，请重新提交双段转换后再筛选"
+            ]},
+        )
+
+    kept_rows, counts = filter_double_rows(
+        job.rows, min_coverage, set(keep_statuses)
+    )
+    tsv = build_filtered_tsv2(kept_rows)
+    payload = b"\xef\xbb\xbf" + tsv.encode("utf-8")
+    filter_token = secrets.token_urlsafe(24)
+    filename = _filtered_name(job.filename, min_coverage)
+    _prune_jobs()
+    _filter_jobs[filter_token] = _FilterJob(
+        tsv_bytes=payload, filename=filename,
+        created_at=time.time(), parent_token=token,
+    )
+
+    # 预览与原始结果同构（total/counts/rows）；counts 为各状态统计，
+    # 其中 unmapped 始终计入，但 rows/total 只含写入筛选结果的行
+    preview = rows_to_preview(kept_rows)
+    preview["counts"] = counts
+    return {
+        "download_token": token,
+        "filter_token": filter_token,
+        "download_name": filename,
+        "download_url": f"/api/download/filtered/{filter_token}",
+        "min_coverage": min_coverage,
+        "keep_statuses": keep_statuses,
+        "counts": counts,
+        "preview": preview,
+    }
+
+
+@app.get("/api/download/filtered/{filter_token}")
+async def download_filtered(filter_token: str) -> Response:
+    """下载质量筛选版 TSV（双段 25 列 + final_coverage 列）。"""
+    _prune_jobs()
+    fjob = _filter_jobs.get(filter_token)
+    if fjob is None:
+        raise HTTPException(
+            status_code=404,
+            detail={"errors": ["筛选结果不存在或已过期，请重新提交筛选"]},
+        )
+    return Response(
+        content=fjob.tsv_bytes,
+        media_type="text/tab-separated-values; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{fjob.filename}"'},
     )
 
 

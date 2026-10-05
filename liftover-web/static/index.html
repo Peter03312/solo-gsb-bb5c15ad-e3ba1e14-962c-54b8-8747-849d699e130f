@@ -140,6 +140,53 @@
         <tbody id="result-tbody"></tbody>
       </table>
     </div>
+
+    <div id="filter-panel" class="filter-panel hidden">
+      <h3>质量筛选（双段结果）</h3>
+      <p class="filter-desc">
+        按每条路径的最终覆盖率（seg2_covered / total_len）筛选：输入最小覆盖率（0~1）
+        并勾选要保留的状态。歧义行按路径分别判断，通过阈值的路径全部保留，不自动裁决；
+        无映射行始终计入统计，但不写入筛选结果。筛选不影响原始结果与裁决状态。
+      </p>
+      <div class="form-row filter-controls">
+        <label class="filter-cov">
+          最小最终覆盖率（0~1）
+          <input type="number" id="min-cov" min="0" max="1" step="0.01" value="0.8">
+        </label>
+        <span class="filter-statuses">
+          保留状态：
+          <label class="radio"><input type="checkbox" class="keep-status" value="mapped" checked> 完全映射</label>
+          <label class="radio"><input type="checkbox" class="keep-status" value="partial" checked> 部分映射</label>
+          <label class="radio"><input type="checkbox" class="keep-status" value="ambiguous" checked> 歧义</label>
+          <label class="radio"><input type="checkbox" class="keep-status" value="unmapped"> 无映射（仅计入统计）</label>
+        </span>
+        <button type="button" id="filter-btn">应用筛选</button>
+      </div>
+      <p class="action-msg" id="filter-msg" role="status"></p>
+
+      <div id="filter-result" class="hidden">
+        <div class="result-head">
+          <h4>筛选结果</h4>
+          <button id="filter-download-btn" type="button" class="secondary">下载筛选结果 TSV</button>
+        </div>
+        <div class="stats" id="filter-stats"></div>
+        <p class="preview-note" id="filter-note"></p>
+        <div class="table-wrap">
+          <table id="filter-table">
+            <thead>
+              <tr>
+                <th>源行号</th>
+                <th>源区间</th>
+                <th>状态</th>
+                <th>路径 / 片段（含最终覆盖率）</th>
+                <th>说明</th>
+              </tr>
+            </thead>
+            <tbody id="filter-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
   </section>
 </main>
 

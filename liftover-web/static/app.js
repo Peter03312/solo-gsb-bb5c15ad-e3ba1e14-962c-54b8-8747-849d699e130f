@@ -37,6 +37,15 @@ const downloadAdjBtn = document.getElementById("download-adj-btn");
 const decisionNote = document.getElementById("decision-note");
 const actionMsg = document.getElementById("action-msg");
 const filterBtns = document.querySelectorAll(".filter");
+const filterPanel = document.getElementById("filter-panel");
+const minCovInput = document.getElementById("min-cov");
+const filterBtn = document.getElementById("filter-btn");
+const filterMsg = document.getElementById("filter-msg");
+const filterResult = document.getElementById("filter-result");
+const filterStats = document.getElementById("filter-stats");
+const filterNote = document.getElementById("filter-note");
+const filterTbody = document.getElementById("filter-tbody");
+const filterDownloadBtn = document.getElementById("filter-download-btn");
 
 let currentToken = null;
 let currentName = null;
@@ -47,6 +56,9 @@ let activeFilter = "all";
 let decisions = {};
 let resultVersion = 0;
 let decisionPending = false;
+// 最近一次质量筛选的下载地址（筛选产物独立于原任务）
+let filterDownloadUrl = null;
+let filterDownloadName = null;
 
 function bindHint(input, hintEl) {
   input.addEventListener("change", () => {
@@ -130,7 +142,8 @@ form.addEventListener("submit", async (ev) => {
     currentRows = data.preview.rows;
     decisions = {};
     resultVersion = 0;
-    renderStats(data.preview);
+    resetFilterPanel();
+    renderStats(statsEl, data.preview.total, data.preview.counts);
     await refreshDecisions();
     renderRows();
     resultBox.classList.remove("hidden");
@@ -272,11 +285,11 @@ function showErrors(errors) {
   errorBox.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
-function renderStats(preview) {
-  const c = preview.counts;
-  statsEl.innerHTML = "";
+function renderStats(el, total, counts) {
+  const c = counts;
+  el.innerHTML = "";
   const items = [
-    ["总数", preview.total, ""],
+    ["总数", total, ""],
     ["完全映射", c.mapped, "mapped"],
     ["部分映射", c.partial, "partial"],
     ["歧义", c.ambiguous, "ambiguous"],
@@ -286,7 +299,7 @@ function renderStats(preview) {
     const div = document.createElement("div");
     div.className = `stat ${cls}`;
     div.innerHTML = `<b>${n}</b>${label}`;
-    statsEl.appendChild(div);
+    el.appendChild(div);
   }
 }
 
@@ -520,4 +533,149 @@ function formatSize(n) {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+// ---------------------------------------------------------------------------
+// 双段结果质量筛选（最小最终覆盖率 + 保留状态）
+// ---------------------------------------------------------------------------
+
+function resetFilterPanel() {
+  filterPanel.classList.toggle("hidden", currentKind !== "double");
+  filterResult.classList.add("hidden");
+  filterDownloadUrl = null;
+  filterDownloadName = null;
+  setFilterMsg("");
+}
+
+function setFilterMsg(text, kind) {
+  filterMsg.textContent = text || "";
+  filterMsg.className = `action-msg${kind ? " " + kind : ""}`;
+}
+
+filterBtn.addEventListener("click", async () => {
+  if (!currentToken) return;
+  const raw = minCovInput.value.trim();
+  const cov = Number(raw);
+  if (raw === "" || !Number.isFinite(cov) || cov < 0 || cov > 1) {
+    setFilterMsg("最小最终覆盖率必须是 0~1 之间的数值（含边界）。", "error");
+    return;
+  }
+  const keep = [...document.querySelectorAll(".keep-status:checked")].map(
+    (c) => c.value,
+  );
+  if (!keep.length) {
+    setFilterMsg("请至少勾选一个要保留的状态。", "error");
+    return;
+  }
+
+  filterBtn.disabled = true;
+  setFilterMsg("正在筛选…", "muted");
+  try {
+    const resp = await fetch(
+      `/api/result/${encodeURIComponent(currentToken)}/filter`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ min_coverage: cov, keep_statuses: keep }),
+      },
+    );
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      setFilterMsg(
+        (data.errors && data.errors.join("；")) || `筛选失败（HTTP ${resp.status}）`,
+        "error",
+      );
+      return;
+    }
+    filterDownloadUrl = data.download_url;
+    filterDownloadName = data.download_name;
+    renderFilterResult(data);
+    setFilterMsg(
+      `筛选完成：${data.preview.total} 行写入筛选结果` +
+        `（无映射 ${data.counts.unmapped} 行仅计入统计，不写入结果）。`,
+      "ok",
+    );
+  } catch (err) {
+    setFilterMsg(`网络或服务错误：${err && err.message ? err.message : err}`, "error");
+  } finally {
+    filterBtn.disabled = false;
+  }
+});
+
+filterDownloadBtn.addEventListener("click", () => {
+  if (!filterDownloadUrl) return;
+  triggerDownload(filterDownloadUrl, filterDownloadName || "");
+});
+
+function renderFilterResult(data) {
+  const counts = data.counts;
+  const rows = data.preview.rows;
+  renderStats(filterStats, data.preview.total, counts);
+  filterNote.textContent =
+    `共 ${data.preview.total} 行通过筛选（阈值 ≥ ${data.min_coverage}）；` +
+    `无映射 ${counts.unmapped} 行始终计入上方统计，但不写入筛选结果。` +
+    (rows.length > PREVIEW_LIMIT
+      ? `预览仅显示前 ${PREVIEW_LIMIT} 行，下载的 TSV 包含全部筛选结果。`
+      : "");
+  renderFilterRows(rows);
+  filterResult.classList.remove("hidden");
+}
+
+function renderFilterRows(rows) {
+  filterTbody.innerHTML = "";
+  const shown = rows.slice(0, PREVIEW_LIMIT);
+  for (const row of shown) {
+    const tr = document.createElement("tr");
+
+    const tdLine = document.createElement("td");
+    tdLine.className = "mono";
+    tdLine.textContent = row.line_no;
+
+    const tdSrc = document.createElement("td");
+    tdSrc.className = "mono";
+    tdSrc.textContent = `${row.src_chrom}:${row.src_start}-${row.src_end}`;
+
+    const tdStatus = document.createElement("td");
+    const badge = document.createElement("span");
+    badge.className = `badge ${row.status}`;
+    badge.textContent = STATUS_TEXT[row.status] || row.status;
+    tdStatus.appendChild(badge);
+
+    const tdDest = document.createElement("td");
+    renderFilteredDest(row, tdDest);
+
+    const tdReason = document.createElement("td");
+    tdReason.className = "reason";
+    tdReason.textContent = row.reason || "";
+
+    tr.append(tdLine, tdSrc, tdStatus, tdDest, tdReason);
+    filterTbody.appendChild(tr);
+  }
+}
+
+// 筛选预览的路径列为只读：不提供裁决入口（裁决仍在上方原始预览中进行）
+function renderFilteredDest(row, tdDest) {
+  row.candidates.forEach((cand) => {
+    const div = document.createElement("div");
+    div.className = "cand";
+
+    const head = document.createElement("div");
+    head.className = "cand-head";
+    const cov = cand.total ? cand.seg2_covered / cand.total : 0;
+    head.textContent =
+      `路径 ${cand.path_index} · chain1 #${cand.chain1_id} × chain2 #${cand.chain2_id}` +
+      ` · 最终覆盖率 ${cov.toFixed(4)}（${cand.seg2_covered}/${cand.total} bp）`;
+    div.appendChild(head);
+
+    cand.fragments.forEach((frag, fi) => {
+      const fl = document.createElement("div");
+      fl.className = "frag-line";
+      fl.textContent =
+        `片段${fi + 1} 源[${frag.src_start},${frag.src_end}) → ` +
+        `中间 ${cand.mid_chrom}:[${frag.mid_start},${frag.mid_end})(${cand.mid_strand}) → ` +
+        `${cand.dest_chrom}:[${frag.dest_start},${frag.dest_end})(${cand.dest_strand})`;
+      div.appendChild(fl);
+    });
+    tdDest.appendChild(div);
+  });
 }

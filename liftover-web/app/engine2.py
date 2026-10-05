@@ -48,6 +48,11 @@ class PathCandidate:
     total: int                   # 源区间长度
     uncovered_src: list[tuple[int, int]] = field(default_factory=list)
 
+    @property
+    def final_coverage(self) -> float:
+        """最终覆盖率：完成两段迁移的源碱基占源区间长度的比例（0~1）。"""
+        return self.seg2_covered / self.total if self.total else 0.0
+
 
 @dataclass
 class RowResult2:

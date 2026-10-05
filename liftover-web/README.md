@@ -28,11 +28,12 @@
     │   ├── chain.py          # UCSC chain 解析（严格校验，错误带行号）
     │   ├── engine.py         # 单段区间转换引擎（缺口拆分 / 歧义 / 负链）
     │   ├── engine2.py        # 双段串联引擎（路径 / 回溯 / 失败阶段）
-    │   ├── report.py         # 单段与双段 TSV 导出、预览 JSON
-    │   └── main.py           # FastAPI 入口（含歧义人工裁决接口）
+    │   ├── filtering.py      # 双段结果质量筛选（最小最终覆盖率 + 保留状态）
+    │   ├── report.py         # 单段与双段 TSV 导出、筛选版 TSV、预览 JSON
+    │   └── main.py           # FastAPI 入口（含歧义人工裁决与质量筛选接口）
     ├── static/               # 前端（纯本地资源）
     ├── examples/             # 可直接试用的 BED / chain 示例（含双段示例）
-    ├── tests/                # pytest 测试（73 个用例）
+    ├── tests/                # pytest 测试（105 个用例）
     ├── scripts/init.sh       # 本地开发依赖初始化
     ├── Dockerfile            # 方式 B 构建入口：以本目录为上下文
     ├── docker-compose.yml    # 两种启动方式共用
@@ -206,6 +207,30 @@ bash scripts/init.sh
 
 4. 歧义行的裁决与单段相同（按路径序号选择），下载按钮、
    原始/裁决版 TSV 的用法完全一致。
+5. 双段结果还可做**质量筛选**（见下一节）：按每条路径的最终覆盖率
+   与状态过滤后单独导出 TSV，不影响原始结果与裁决。
+
+### 双段结果质量筛选
+
+双段转换完成后，预览页底部出现「质量筛选」面板（仅双段结果可用）：
+
+1. 输入**最小最终覆盖率**（0~1，含边界）：筛选按**每条路径**的
+   `seg2_covered / total_len`（完成两段迁移的源碱基占源区间长度的比例）
+   计算，达到阈值的路径通过；
+2. 勾选要保留的**状态**（完全映射 / 部分映射 / 歧义；无映射行见下）；
+3. 点击「应用筛选」，页面显示筛选后的预览与**各状态数量**，并可
+   「下载筛选结果 TSV」（双段 25 列 + 末尾 `final_coverage` 列）。
+
+筛选语义：
+
+- **歧义行按路径分别判断**：通过阈值的路径全部保留（路径序号保持
+  原值），系统**不自动替用户裁决**——即使只剩一条路径通过，行的状态
+  仍保持 `ambiguous`；
+- **无映射（unmapped）行始终计入统计**（各状态数量中恒为原结果的无
+  映射行数，与是否勾选无关），但**绝不写入筛选结果**（预览行与 TSV）；
+- 筛选只是原结果的导出视图：原始下载、裁决状态与版本号在筛选前后
+  **完全不变**；参数非法（阈值越界、类型错误、状态集合为空或含非法
+  值）时返回明确错误，原任务不受任何影响。
 
 ### 歧义区间人工裁决
 
@@ -291,6 +316,12 @@ seg1_covered, seg2_covered, total_len, uncovered_src, reason
   并集 / 恒为 0）；
 - 裁决版同样在末尾追加 `decision` 列（`已裁决`/`未裁决`/`.`），
   `candidate_index` 即路径序号，规则与单段一致。
+
+**双段筛选版**（`POST /api/result/{token}/filter` 后
+`GET /api/download/filtered/{filter_token}`）在双段 25 列末尾追加一列
+`final_coverage`（该路径 `seg2_covered/total_len`，即筛选时使用的最终
+覆盖率，如 `1`、`0.833333`），只包含通过筛选的行与路径；unmapped 行
+不写入。
 
 ### 失败即阻止导出
 
@@ -512,6 +543,68 @@ curl -OJ "http://localhost:8080/api/download/${TOKEN}/adjudicated"
 - 其他状态行照原结果输出（`decision=.`），`status` 列保持原值；
 - 与原始下载互不影响：`GET /api/download/{token}` 仍是裁决前的内容。
 
+### 双段结果质量筛选
+
+`POST /api/result/{download_token}/filter`，`application/json`，仅适用于
+双段转换结果（`POST /api/liftover2` 返回的 token）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `min_coverage` | 数值 | 最小最终覆盖率，0~1（含边界）；按每条路径的 `seg2_covered/total_len` 判定 |
+| `keep_statuses` | 字符串数组 | 要保留的状态，元素取自 `mapped`/`partial`/`ambiguous`/`unmapped`，至少一个 |
+
+```bash
+# 保留最终覆盖率 ≥ 0.9 的完全映射/部分映射/歧义行
+curl -s -X POST "http://localhost:8080/api/result/${TOKEN}/filter" \
+  -H 'Content-Type: application/json' \
+  -d '{"min_coverage":0.9,"keep_statuses":["mapped","partial","ambiguous"]}'
+```
+
+成功（200）返回筛选后的预览、各状态数量与筛选下载令牌：
+
+```json
+{
+  "download_token": "……",
+  "filter_token": "……",
+  "download_name": "liftover_double_target-target_20261005-120000.filtered.min-cov-0.9.tsv",
+  "download_url": "/api/download/filtered/……",
+  "min_coverage": 0.9,
+  "keep_statuses": ["mapped", "partial", "ambiguous"],
+  "counts": {"mapped": 1, "partial": 0, "ambiguous": 1, "unmapped": 4},
+  "preview": {
+    "total": 2,
+    "counts": {"mapped": 1, "partial": 0, "ambiguous": 1, "unmapped": 4},
+    "rows": []
+  }
+}
+```
+
+- `counts` 为各状态统计：`unmapped` **始终计入**（原结果的无映射行数，
+  与 `keep_statuses` 是否包含它无关）；`preview.rows` / `preview.total`
+  只含写入筛选结果的行，**unmapped 行绝不写入**；
+- 歧义行按路径分别判断，通过阈值的路径全部保留（`path_index` 保持原
+  序号），状态仍为 `ambiguous`，不自动裁决；
+- 筛选不影响原任务：原始/裁决版下载字节与裁决版本号在筛选前后不变。
+
+下载筛选版 TSV（双段 25 列 + 末尾 `final_coverage` 列，UTF-8 带 BOM）：
+
+```bash
+FILTER_TOKEN=<上一步返回的 filter_token>
+curl -OJ "http://localhost:8080/api/download/filtered/${FILTER_TOKEN}"
+```
+
+明确拒绝的情形（均不改变原任务）：
+
+| 场景 | 状态码 | 说明 |
+| --- | --- | --- |
+| token 不存在 / 结果已过期 | 404 | 需重新提交转换 |
+| 该 token 是单段转换结果 | 400 | 质量筛选仅适用于双段结果 |
+| `min_coverage` 越界（<0 或 >1） | 400 | 错误信息标明允许范围 [0, 1] |
+| `min_coverage` 类型非法（字符串、`true`、NaN 等） | 400 | 必须是 0~1 的有限数值 |
+| `keep_statuses` 缺失 / 非数组 / 为空 / 含非法状态 | 400 | 错误信息列出允许值 |
+| 请求体不是 JSON 对象 | 400 | |
+| filter_token 不存在 / 筛选结果已过期 | 404 | 需重新提交筛选 |
+
 ---
 
 ## 五、快速试用
@@ -559,6 +652,13 @@ curl -s -X POST "http://localhost:8080/api/result/${TOKEN}/decisions" \
   -H 'Content-Type: application/json' \
   -d '{"version":0,"source_line":6,"candidate_index":2}'
 curl -OJ "http://localhost:8080/api/download/${TOKEN}/adjudicated"
+
+# 质量筛选：保留最终覆盖率 ≥ 0.9 的 mapped/partial/ambiguous 行并下载筛选版
+FILTER_TOKEN=$(curl -s -X POST "http://localhost:8080/api/result/${TOKEN}/filter" \
+  -H 'Content-Type: application/json' \
+  -d '{"min_coverage":0.9,"keep_statuses":["mapped","partial","ambiguous"]}' \
+  | python3 -c "import json,sys; print(json.load(sys.stdin)['filter_token'])")
+curl -OJ "http://localhost:8080/api/download/filtered/${FILTER_TOKEN}"
 ```
 
 该示例 8 行数据覆盖：完全映射（行 3）、第二段缺口导致的部分映射
