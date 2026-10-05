@@ -32,11 +32,18 @@ from .chain import parse_chain
 from .engine import RowResult
 from .engine import LiftOverEngine
 from .engine2 import TwoSegmentEngine
+from .quality import (
+    FILTERABLE_STATUSES,
+    apply_quality_filter,
+    kept_row_to_dict,
+    trimmed_row,
+)
 from .report import (
     build_adjudicated_tsv,
     build_adjudicated_tsv2,
     build_tsv,
     build_tsv2,
+    build_tsv2_rows,
     rows_to_preview,
 )
 
@@ -47,7 +54,7 @@ MAX_UPLOAD_BYTES = int(os.getenv("LIFTOVER_MAX_UPLOAD_MB", "50")) * 1024 * 1024
 JOB_TTL_SECONDS = int(os.getenv("LIFTOVER_JOB_TTL_SECONDS", "3600"))
 MAX_JOBS = int(os.getenv("LIFTOVER_MAX_JOBS", "100"))
 
-app = FastAPI(title="离线基因组区间迁移 (BED liftover)", version="1.2.0")
+app = FastAPI(title="离线基因组区间迁移 (BED liftover)", version="1.3.0")
 
 
 @dataclass
@@ -392,6 +399,140 @@ async def download_adjudicated(token: str) -> Response:
         text = build_adjudicated_tsv(job.rows, job.decisions)
     payload = b"\xef\xbb\xbf" + text.encode("utf-8")
     filename = _adjudicated_name(job.filename, job.version)
+    return Response(
+        content=payload,
+        media_type="text/tab-separated-values; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ---------------------------------------------------------------------------
+# 双段结果质量筛选（只读，不改动原任务）
+#
+# - GET /api/result/{token}/quality-filter：按 seg2_covered/total 与所选
+#   状态计算筛选后的预览与各状态数量；
+# - GET /api/download/{token}/filtered：按相同参数即时生成并下载筛选 TSV
+#   （25 列，与双段原始 TSV 同表头；unmapped 行只统计、不写入）。
+#
+# 歧义行按路径分别判断，保留通过阈值的全部候选，不自动替用户裁决。
+# 两个接口都不修改 _Job：不产生新令牌、不影响原始/裁决版下载与裁决版本。
+# ---------------------------------------------------------------------------
+
+def _parse_quality_params(request: Request) -> tuple[float, tuple[str, ...]]:
+    """从查询串解析质量筛选参数，任何格式错误都汇总为 400。"""
+    errors: list[str] = []
+    q = request.query_params
+
+    if "min_coverage" not in q:
+        errors.append("缺少参数 min_coverage（最小最终覆盖率，0～1 的小数）")
+        min_coverage = None
+    else:
+        raw = q.get("min_coverage")
+        try:
+            min_coverage = float(raw)
+        except (TypeError, ValueError):
+            errors.append(
+                f"min_coverage 必须是 0～1 的小数，收到 {raw!r}，无法解析"
+            )
+            min_coverage = None
+        else:
+            # nan/inf 不能作为阈值参与比较
+            if min_coverage != min_coverage or min_coverage in (float("inf"), float("-inf")):
+                errors.append(
+                    f"min_coverage 必须是 0～1 的有限小数，收到 {raw!r}"
+                )
+            elif not 0.0 <= min_coverage <= 1.0:
+                errors.append(
+                    f"min_coverage 必须在 0～1 之间（含端点），收到 {min_coverage}"
+                )
+
+    statuses_raw = q.getlist("statuses")
+    statuses: list[str] = []
+    n_valid = 0
+    for s in statuses_raw:
+        s = s.strip()
+        if not s:
+            errors.append("statuses 不能为空（可选值：mapped / partial / ambiguous）")
+            continue
+        if s not in FILTERABLE_STATUSES:
+            errors.append(
+                f"statuses 取值非法：{s!r}（仅支持 mapped / partial / ambiguous；"
+                "unmapped 始终统计但不写入筛选结果，无需也不能勾选）"
+            )
+            continue
+        n_valid += 1
+        if s not in statuses:
+            statuses.append(s)
+    if not statuses_raw:
+        errors.append("缺少参数 statuses（至少选择一个要保留的状态：mapped / partial / ambiguous）")
+    elif n_valid == 0:
+        # 全部为空串/非法值的情况上面已逐条报错，这里兜底保证不继续处理
+        errors.append("至少需要勾选一个保留状态（mapped / partial / ambiguous）")
+
+    if errors:
+        raise HTTPException(status_code=400, detail={"errors": errors})
+    return min_coverage, tuple(statuses)
+
+
+def _filtered_name(filename: str, min_coverage: float, statuses: tuple[str, ...]) -> str:
+    tag = "".join({"mapped": "m", "partial": "p", "ambiguous": "a"}[s] for s in statuses)
+    cov = ("%g" % min_coverage).replace(".", "_")
+    base = filename[:-4] if filename.endswith(".tsv") else filename
+    return f"{base}.filtered.cov{cov}.{tag}.tsv"
+
+
+@app.get("/api/result/{token}/quality-filter")
+async def quality_filter(token: str, request: Request) -> dict:
+    """双段结果质量筛选预览（按每条路径 seg2_covered/total）。
+
+    查询参数：``min_coverage``（0～1 小数）与一个或多个
+    ``statuses``（mapped / partial / ambiguous）。只读：不改动原任务的
+    原始 TSV、裁决状态与版本号。
+    """
+    job = _get_job_or_404(token)
+    if job.kind != "double":
+        raise HTTPException(
+            status_code=400,
+            detail={"errors": [
+                "质量筛选仅支持双段（double）转换结果；该 token 对应的是单段结果，"
+                "请先调用 /api/liftover2 生成双段结果"
+            ]},
+        )
+    min_coverage, statuses = _parse_quality_params(request)
+
+    result = apply_quality_filter(job.rows, min_coverage, statuses)
+    return {
+        "download_token": token,
+        "kind": "double",
+        "min_coverage": min_coverage,
+        "statuses": list(statuses),
+        "download_name": _filtered_name(job.filename, min_coverage, statuses),
+        "counts": result.counts,
+        "rows": [kept_row_to_dict(kr) for kr in result.kept],
+    }
+
+
+@app.get("/api/download/{token}/filtered")
+async def download_filtered(token: str, request: Request) -> Response:
+    """下载质量筛选 TSV（参数与预览接口一致，即时生成）。
+
+    25 列、表头与双段原始 TSV 完全相同；只写通过筛选的行：歧义行仅写
+    通过阈值的路径（path_index 沿用原序号，不做裁决），unmapped 行
+    始终不写入。原始任务与裁决状态不受影响。
+    """
+    job = _get_job_or_404(token)
+    if job.kind != "double":
+        raise HTTPException(
+            status_code=400,
+            detail={"errors": ["质量筛选仅支持双段（double）转换结果"]},
+        )
+    min_coverage, statuses = _parse_quality_params(request)
+
+    result = apply_quality_filter(job.rows, min_coverage, statuses)
+    trimmed = [trimmed_row(kr) for kr in result.kept]
+    text = build_tsv2_rows(trimmed)
+    payload = b"\xef\xbb\xbf" + text.encode("utf-8")
+    filename = _filtered_name(job.filename, min_coverage, statuses)
     return Response(
         content=payload,
         media_type="text/tab-separated-values; charset=utf-8",

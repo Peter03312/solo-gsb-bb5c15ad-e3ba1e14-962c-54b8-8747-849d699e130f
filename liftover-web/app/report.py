@@ -261,6 +261,23 @@ def build_tsv2(rows: list[RowResult2]) -> str:
     return buf.getvalue()
 
 
+def build_tsv2_rows(rows: list[RowResult2]) -> str:
+    """质量筛选 TSV：只输出给定的行子集，表头/列序与 ``build_tsv2`` 完全一致。
+
+    传入的行应为筛选后的 RowResult2（歧义行的 candidates 已按路径裁剪，
+    路径序号保持原值）；unmapped 行不应传入（筛选规则只统计、不落结果）。
+    """
+    buf = io.StringIO(newline="")
+    writer = csv.writer(buf, delimiter="\t", lineterminator="\n",
+                        quoting=csv.QUOTE_MINIMAL)
+    writer.writerow(TSV2_HEADER)
+    for row in rows:
+        for path in row.candidates:
+            for fi, frag in enumerate(path.fragments, start=1):
+                writer.writerow(_path_fragment_values(row, path, frag, fi))
+    return buf.getvalue()
+
+
 def build_adjudicated_tsv2(
     rows: list[RowResult2],
     decisions: Mapping[int, int],

@@ -131,6 +131,7 @@ form.addEventListener("submit", async (ev) => {
     decisions = {};
     resultVersion = 0;
     renderStats(data.preview);
+    resetQualityFilter();
     await refreshDecisions();
     renderRows();
     resultBox.classList.remove("hidden");
@@ -520,4 +521,204 @@ function formatSize(n) {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / (1024 * 1024)).toFixed(2)} MB`;
+}
+
+// ===========================================================================
+// 双段结果质量筛选（只读；按路径 seg2_covered/total，歧义按路径分别判断）
+// ===========================================================================
+
+const qualityBox = document.getElementById("quality-box");
+const qualityForm = document.getElementById("quality-form");
+const qfCoverageInput = document.getElementById("qf-coverage");
+const qfErrorList = document.getElementById("qf-error-list");
+const qfResult = document.getElementById("qf-result");
+const qfStats = document.getElementById("qf-stats");
+const qfNote = document.getElementById("qf-note");
+const qfTbody = document.getElementById("qf-tbody");
+const qfDownloadBtn = document.getElementById("qf-download-btn");
+const QF_PREVIEW_LIMIT = 1000;
+
+let qfParams = null;   // 上次成功筛选的查询参数（供下载复用），null 表示尚无结果
+let qfName = "";
+let qfRows = [];
+
+function resetQualityFilter() {
+  qfParams = null;
+  qfName = "";
+  qfRows = [];
+  qfResult.classList.add("hidden");
+  qfErrorList.classList.add("hidden");
+  qfErrorList.innerHTML = "";
+  // 仅双段结果提供质量筛选
+  qualityBox.classList.toggle("hidden", currentKind !== "double");
+}
+
+function showQualityErrors(errors) {
+  qfErrorList.innerHTML = "";
+  for (const msg of errors) {
+    const li = document.createElement("li");
+    li.textContent = `• ${msg}`;
+    qfErrorList.appendChild(li);
+  }
+  qfErrorList.classList.remove("hidden");
+}
+
+function qfSelectedStatuses() {
+  return Array.from(qualityForm.querySelectorAll('input[name="qf-status"]:checked'))
+    .map((el) => el.value);
+}
+
+function buildQualityParams(minCoverage, statuses) {
+  const p = new URLSearchParams();
+  p.append("min_coverage", String(minCoverage));
+  for (const s of statuses) p.append("statuses", s);
+  return p;
+}
+
+qualityForm.addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  qfErrorList.classList.add("hidden");
+  if (!currentToken || currentKind !== "double") return;
+
+  const raw = (qfCoverageInput.value || "").trim();
+  const clientErrors = [];
+  const minCoverage = Number(raw);
+  if (raw === "" || !Number.isFinite(minCoverage)) {
+    clientErrors.push("请输入 0～1 之间的小数作为最小最终覆盖率。");
+  } else if (minCoverage < 0 || minCoverage > 1) {
+    clientErrors.push(`最小最终覆盖率必须在 0～1 之间（含端点），当前为 ${raw}。`);
+  }
+  const statuses = qfSelectedStatuses();
+  if (statuses.length === 0) {
+    clientErrors.push("请至少勾选一个要保留的状态（完全映射 / 部分映射 / 歧义）。");
+  }
+  if (clientErrors.length) {
+    showQualityErrors(clientErrors);
+    return;
+  }
+
+  const params = buildQualityParams(raw, statuses);
+  const resp = await fetch(
+    `/api/result/${encodeURIComponent(currentToken)}/quality-filter?${params}`,
+  );
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    showQualityErrors(data.errors || [`筛选请求失败（HTTP ${resp.status}）`]);
+    return;
+  }
+
+  qfParams = params;
+  qfName = data.download_name;
+  qfRows = data.rows;
+  renderQualityStats(data);
+  renderQualityRows(data);
+  qfResult.classList.remove("hidden");
+});
+
+qfDownloadBtn.addEventListener("click", () => {
+  if (!currentToken || !qfParams) return;
+  triggerDownload(
+    `/api/download/${encodeURIComponent(currentToken)}/filtered?${qfParams.toString()}`,
+    qfName || "",
+  );
+});
+
+function renderQualityStats(data) {
+  const c = data.counts;
+  qfStats.innerHTML = "";
+  const items = [
+    ["筛选保留", c.total, "mapped", `原始共 ${c.source_total} 行`],
+    ["完全映射", c.kept.mapped, "mapped", `原始 ${c.source.mapped}`],
+    ["部分映射", c.kept.partial, "partial", `原始 ${c.source.partial}`],
+    ["歧义", c.kept.ambiguous, "ambiguous", `原始 ${c.source.ambiguous}`],
+    ["阈值丢弃", c.dropped_by_threshold, "partial", ""],
+    ["未勾选丢弃", c.dropped_by_status, "partial", ""],
+    ["unmapped（不写入）", c.dropped_unmapped, "unmapped", "仅统计"],
+  ];
+  for (const [label, n, cls, small] of items) {
+    const div = document.createElement("div");
+    div.className = `stat qf-stat ${cls}`;
+    div.innerHTML = `<b>${n}</b>${label}` + (small ? `<small>${small}</small>` : "");
+    qfStats.appendChild(div);
+  }
+}
+
+function renderQualityRows(data) {
+  qfTbody.innerHTML = "";
+  const c = data.counts;
+  const ambNote = c.ambiguous_paths_dropped > 0
+    ? `另有 ${c.ambiguous_paths_dropped} 条歧义路径因覆盖率不足被裁掉（对应歧义行仍保留其余通过路径，不自动裁决）。`
+    : "";
+  qfNote.textContent =
+    `阈值 ${data.min_coverage}，保留状态：${data.statuses.join(" / ")}。` +
+    `共保留 ${c.total} 行；丢弃 ${c.dropped_total} 行（覆盖率不足 ${c.dropped_by_threshold} 行、` +
+    `状态未勾选 ${c.dropped_by_status} 行、unmapped ${c.dropped_unmapped} 行仅统计不写入）。${ambNote} ` +
+    (qfRows.length > QF_PREVIEW_LIMIT
+      ? `预览仅显示前 ${QF_PREVIEW_LIMIT} 行，下载的 TSV 包含全部 ${c.total} 行。`
+      : "");
+
+  const shown = qfRows.slice(0, QF_PREVIEW_LIMIT);
+  for (const row of shown) {
+    const tr = document.createElement("tr");
+
+    const tdLine = document.createElement("td");
+    tdLine.className = "mono";
+    tdLine.textContent = row.line_no;
+
+    const tdSrc = document.createElement("td");
+    tdSrc.className = "mono";
+    tdSrc.textContent = `${row.src_chrom}:${row.src_start}-${row.src_end}`;
+
+    const tdStatus = document.createElement("td");
+    const badge = document.createElement("span");
+    badge.className = `badge ${row.status}`;
+    badge.textContent = STATUS_TEXT[row.status] || row.status;
+    tdStatus.appendChild(badge);
+
+    const tdDest = document.createElement("td");
+    const box = document.createElement("div");
+    box.className = "decision-box";
+    row.candidates.forEach((cand) => {
+      const div = document.createElement("div");
+      div.className = "cand decision-cand";
+
+      const head = document.createElement("div");
+      head.className = "cand-head";
+      const covPct = (cand.coverage * 100).toFixed(1);
+      head.innerHTML =
+        `路径 ${cand.path_index} · chain1 #${cand.chain1_id} × chain2 #${cand.chain2_id}` +
+        ` <span class="qf-cov">` +
+        `最终覆盖率 ${cand.seg2_covered}/${cand.total} = ${covPct}%</span>`;
+      div.appendChild(head);
+
+      const cov = document.createElement("div");
+      cov.className = "path-cov";
+      cov.textContent =
+        `覆盖：第一段 ${cand.seg1_covered}/${cand.total} bp → ` +
+        `第二段 ${cand.seg2_covered}/${cand.seg1_covered} bp` +
+        (cand.uncovered_src && cand.uncovered_src.length
+          ? `；未覆盖源区间 ${fmtUncovered(cand.uncovered_src)}`
+          : "");
+      div.appendChild(cov);
+
+      cand.fragments.forEach((frag) => {
+        const fl = document.createElement("div");
+        fl.className = "frag-line";
+        fl.textContent =
+          `片段 源[${frag.src_start},${frag.src_end}) → ` +
+          `中间 ${cand.mid_chrom}:[${frag.mid_start},${frag.mid_end})(${cand.mid_strand}) → ` +
+          `${cand.dest_chrom}:[${frag.dest_start},${frag.dest_end})(${cand.dest_strand})`;
+        div.appendChild(fl);
+      });
+      box.appendChild(div);
+    });
+    tdDest.appendChild(box);
+
+    const tdReason = document.createElement("td");
+    tdReason.className = "reason";
+    tdReason.textContent = row.reason || "";
+
+    tr.append(tdLine, tdSrc, tdStatus, tdDest, tdReason);
+    qfTbody.appendChild(tr);
+  }
 }

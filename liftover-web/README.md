@@ -28,11 +28,12 @@
     │   ├── chain.py          # UCSC chain 解析（严格校验，错误带行号）
     │   ├── engine.py         # 单段区间转换引擎（缺口拆分 / 歧义 / 负链）
     │   ├── engine2.py        # 双段串联引擎（路径 / 回溯 / 失败阶段）
+    │   ├── quality.py        # 双段结果质量筛选（按路径最终覆盖率，纯只读）
     │   ├── report.py         # 单段与双段 TSV 导出、预览 JSON
-    │   └── main.py           # FastAPI 入口（含歧义人工裁决接口）
+    │   └── main.py           # FastAPI 入口（含歧义人工裁决、质量筛选接口）
     ├── static/               # 前端（纯本地资源）
     ├── examples/             # 可直接试用的 BED / chain 示例（含双段示例）
-    ├── tests/                # pytest 测试（73 个用例）
+    ├── tests/                # pytest 测试（100 个用例）
     ├── scripts/init.sh       # 本地开发依赖初始化
     ├── Dockerfile            # 方式 B 构建入口：以本目录为上下文
     ├── docker-compose.yml    # 两种启动方式共用
@@ -207,6 +208,30 @@ bash scripts/init.sh
 4. 歧义行的裁决与单段相同（按路径序号选择），下载按钮、
    原始/裁决版 TSV 的用法完全一致。
 
+### 双段结果质量筛选（按最终覆盖率）
+
+双段转换完成后，可在**已有结果**上做质量筛选（只读，不重新转换、
+不改变原任务的原始 TSV 与裁决状态）：
+
+1. 在预览页下方「质量筛选」区输入**最小最终覆盖率**（0～1 的小数），
+   并勾选要保留的状态（完全映射 / 部分映射 / 歧义）；
+2. 点「应用筛选并预览」。系统对每条路径按
+   `seg2_covered / total`（完成两段迁移的源碱基 / 源区间总长）判断：
+   - mapped / partial 行作为**整行**判断，达到阈值才保留；
+   - **歧义行按路径分别判断**：保留该行中全部达到阈值的路径候选，
+     路径序号（`path_index`）不变，系统**不自动替您裁决**；若该行
+     所有路径都低于阈值，则整行不进入结果；
+   - **unmapped 行始终保留在统计中**（页面与返回 JSON 都给出原始
+     各状态数量），但**不会写入筛选 TSV**；
+3. 页面给出筛选后预览、保留/丢弃的各状态数量（含「因阈值丢弃」「因
+   未勾选状态丢弃」「unmapped 仅统计」），点「下载筛选结果 TSV」
+   获取下载文件（25 列，与双段原始 TSV 表头完全一致）。
+
+阈值越界（<0 或 >1）、参数无法解析、未勾选任何状态、结果不是双段
+（单段任务不支持质量筛选）、token 不存在/过期时返回明确错误，
+**不会改变或新建任何任务**；筛选没有独立令牌，每次预览/下载都按
+服务端当前的原任务结果即时计算。
+
 ### 歧义区间人工裁决
 
 歧义区间（`ambiguous`）不能自动进入下游分析，必须经人工裁决。
@@ -291,6 +316,20 @@ seg1_covered, seg2_covered, total_len, uncovered_src, reason
   并集 / 恒为 0）；
 - 裁决版同样在末尾追加 `decision` 列（`已裁决`/`未裁决`/`.`），
   `candidate_index` 即路径序号，规则与单段一致。
+
+**质量筛选结果**（`GET /api/download/{token}/filtered` 产生）使用与
+双段原始结果**完全相同的 25 列表头**，区别只在于行的取舍：
+
+- 只写达到覆盖率阈值且状态被勾选的行；
+- 歧义行只写通过阈值的路径（可只剩其中一条），`path_index` 沿用
+  原始路径序号，`status` 仍写作 `ambiguous`——筛选不是裁决，不读取、
+  也不影响该结果的人工裁决状态；
+- `unmapped` 行**绝不写入**（但其数量在预览接口的 `counts.source` /
+  `counts.dropped_unmapped` 中始终可查）。
+
+文件名形如
+`liftover_double_target-target_<时间戳>.filtered.cov0_9.mpa.tsv`
+（`cov` 后为阈值，`m/p/a` 表示勾选了哪些状态）。
 
 ### 失败即阻止导出
 
@@ -512,6 +551,88 @@ curl -OJ "http://localhost:8080/api/download/${TOKEN}/adjudicated"
 - 其他状态行照原结果输出（`decision=.`），`status` 列保持原值；
 - 与原始下载互不影响：`GET /api/download/{token}` 仍是裁决前的内容。
 
+### 双段结果质量筛选预览
+
+`GET /api/result/{download_token}/quality-filter`，查询参数：
+
+| 参数 | 类型 | 说明 |
+| --- | --- | --- |
+| `min_coverage` | 数字 | 最小最终覆盖率（`seg2_covered/total`），0～1 的小数，**含端点** |
+| `statuses` | 文本（可重复） | 要保留的状态，可传多个：`mapped` / `partial` / `ambiguous`；`unmapped` 无需也不能传 |
+
+```bash
+# 阈值 0.9，保留三种状态（多个 statuses 重复传参）
+curl -s -G "http://localhost:8080/api/result/${TOKEN}/quality-filter" \
+  --data-urlencode "min_coverage=0.9" \
+  --data-urlencode "statuses=mapped" \
+  --data-urlencode "statuses=partial" \
+  --data-urlencode "statuses=ambiguous"
+```
+
+成功（200）返回筛选后预览与各状态数量：
+
+```json
+{
+  "download_token": "……",
+  "kind": "double",
+  "min_coverage": 0.9,
+  "statuses": ["mapped", "partial", "ambiguous"],
+  "download_name": "liftover_double_target-target_20261005-120000.filtered.cov0_9.mpa.tsv",
+  "counts": {
+    "total": 2,
+    "kept": {"mapped": 1, "partial": 0, "ambiguous": 1, "unmapped": 0},
+    "source_total": 8,
+    "source": {"mapped": 1, "partial": 2, "ambiguous": 1, "unmapped": 4},
+    "dropped_total": 6,
+    "dropped": {"mapped": 0, "partial": 2, "ambiguous": 0, "unmapped": 4},
+    "dropped_by_threshold": 2,
+    "dropped_by_status": 0,
+    "dropped_unmapped": 4,
+    "ambiguous_rows_total": 1,
+    "ambiguous_paths_dropped": 0
+  },
+  "rows": [ /* 结构与双段预览一致；每个候选额外带 coverage（0～1）*/ ]
+}
+```
+
+- `counts.total` / `counts.kept`：**写入筛选结果**的行数（unmapped
+  永远为 0、不计入）；
+- `counts.source` / `source_total`：**原任务**全量各状态数量，
+  unmapped 始终在内；
+- `dropped_by_threshold`：因覆盖率不足丢弃的行数；
+  `dropped_by_status`：因状态未勾选丢弃的非 unmapped 行数；
+  `dropped_unmapped`：unmapped 行数（只统计）；
+- `ambiguous_paths_dropped`：歧义行中被阈值裁掉的**路径**数（该行可能
+  仍凭其余路径保留）；预览 `rows` 中歧义行只含通过阈值的候选，
+  `path_index` 保持原序号，`coverage` 是该路径最终覆盖率。
+
+### 下载质量筛选 TSV
+
+`GET /api/download/{download_token}/filtered`，查询参数与预览接口
+完全一致（建议直接复用预览时的参数），服务端即时生成：
+
+```bash
+curl -OJ -G "http://localhost:8080/api/download/${TOKEN}/filtered" \
+  --data-urlencode "min_coverage=0.9" \
+  --data-urlencode "statuses=mapped" \
+  --data-urlencode "statuses=partial" \
+  --data-urlencode "statuses=ambiguous"
+```
+
+- 200：25 列双段 TSV（UTF-8 带 BOM），表头与原始双段 TSV 相同；
+  只含通过筛选的行，歧义行只写通过的路径，unmapped 不写入；
+- 筛选为只读操作：不产生新令牌，不改变 `GET /api/download/{token}`
+  的字节内容，也不影响裁决版本与 `/adjudicated` 下载。
+
+明确拒绝的情形：
+
+| 场景 | 状态码 | 说明 |
+| --- | --- | --- |
+| token 不存在 / 结果已过期 | 404 | 预览与下载接口一致，需重新提交转换 |
+| `min_coverage` 越界（<0 或 >1）或不是数字（含空值、`nan`/`inf`） | 400 | 错误信息带回收到的值 |
+| 缺少 `min_coverage` / `statuses`，或 `statuses` 为空/非法 | 400 | `unmapped` 作为 statuses 传值同样拒绝 |
+| token 对应的是**单段**结果 | 400 | 质量筛选仅支持双段结果 |
+
 ---
 
 ## 五、快速试用
@@ -565,6 +686,26 @@ curl -OJ "http://localhost:8080/api/download/${TOKEN}/adjudicated"
 （行 4）、第一段+第二段缺口叠加的部分映射（行 5）、双路径歧义
 （行 6）、第二段无映射（行 7 中间染色体不存在、行 8 落在对齐范围外）、
 第一段无映射（行 9 范围外、行 10 无此染色体）。
+
+对该结果按最终覆盖率 ≥ 0.9 做质量筛选并下载（unmapped 只统计、不落盘；
+行 4 覆盖率 100/120≈0.83、行 5 为 10/60≈0.17，均被阈值丢弃，
+保留行 3 与歧义行 6 的全部两条路径）：
+
+```bash
+# 预览
+curl -s -G "http://localhost:8080/api/result/${TOKEN}/quality-filter" \
+  --data-urlencode "min_coverage=0.9" \
+  --data-urlencode "statuses=mapped" \
+  --data-urlencode "statuses=partial" \
+  --data-urlencode "statuses=ambiguous"
+
+# 下载筛选 TSV（25 列，与双段原始 TSV 同表头）
+curl -OJ -G "http://localhost:8080/api/download/${TOKEN}/filtered" \
+  --data-urlencode "min_coverage=0.9" \
+  --data-urlencode "statuses=mapped" \
+  --data-urlencode "statuses=partial" \
+  --data-urlencode "statuses=ambiguous"
+```
 
 ---
 

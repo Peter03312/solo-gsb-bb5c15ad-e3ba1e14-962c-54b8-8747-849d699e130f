@@ -140,6 +140,52 @@
         <tbody id="result-tbody"></tbody>
       </table>
     </div>
+
+    <div id="quality-box" class="quality-box hidden">
+      <h3>质量筛选（双段结果，按最终覆盖率 seg2_covered / total）</h3>
+      <p class="quality-hint">
+        对<strong>本次双段结果</strong>做只读筛选：按每条路径的
+        <span class="mono">seg2_covered / total</span> 与下方阈值比较，
+        歧义行<strong>按路径分别判断</strong>，保留通过阈值的全部路径候选，
+        不会替您自动裁决；<strong>unmapped 行始终计入统计，但不会写入筛选 TSV</strong>。
+        筛选不影响上方原始结果、裁决状态与原始/裁决版下载。
+      </p>
+      <form id="quality-form" class="quality-form">
+        <label class="qf-field">
+          最小最终覆盖率（0～1）
+          <input type="number" id="qf-coverage" min="0" max="1" step="0.01" value="0.9" inputmode="decimal">
+        </label>
+        <span class="qf-field">
+          <span class="qf-label">保留状态</span>
+          <label class="radio"><input type="checkbox" name="qf-status" value="mapped" checked> 完全映射</label>
+          <label class="radio"><input type="checkbox" name="qf-status" value="partial" checked> 部分映射</label>
+          <label class="radio"><input type="checkbox" name="qf-status" value="ambiguous" checked> 歧义（按路径筛选）</label>
+        </span>
+        <button type="submit" id="qf-submit-btn">应用筛选并预览</button>
+      </form>
+      <ul id="qf-error-list" class="qf-errors hidden"></ul>
+      <div id="qf-result" class="hidden">
+        <div class="qf-head">
+          <div class="stats qf-stats" id="qf-stats"></div>
+          <button id="qf-download-btn" type="button" class="secondary">下载筛选结果 TSV（25 列）</button>
+        </div>
+        <p class="preview-note" id="qf-note"></p>
+        <div class="table-wrap">
+          <table id="qf-table">
+            <thead>
+              <tr>
+                <th>源行号</th>
+                <th>源区间</th>
+                <th>状态</th>
+                <th>保留路径 / 片段（路径最终覆盖率 · 目标坐标）</th>
+                <th>说明</th>
+              </tr>
+            </thead>
+            <tbody id="qf-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
   </section>
 </main>
 
